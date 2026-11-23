@@ -4,8 +4,20 @@ name: e2e
 on:
   push:
     branches: [dev, main]
+    paths-ignore:
+      # Fork CI diet: docs-only changes need no runner minutes. landing/ is
+      # intentionally NOT ignored here: the smoke suite exercises it.
+      - '**.md'
+      - 'docs/**'
+      - 'screenshots/**'
+      - '.impeccable/**'
   pull_request:
     types: [opened, synchronize, reopened, edited]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'screenshots/**'
+      - '.impeccable/**'
   workflow_dispatch:
 permissions:
   contents: read

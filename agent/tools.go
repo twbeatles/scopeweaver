@@ -336,10 +336,20 @@ func (t *ToolSet) writeExpTool(name, desc string, schema map[string]any, run fun
 func (t *ToolSet) needExploration(name string, run func(context.Context, json.RawMessage) (actool.Result, error)) func(context.Context, json.RawMessage) (actool.Result, error) {
 	return func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		if t.ts == nil {
-			return actool.Errorf(name + locale.Text(locale.FromContext(ctx), " requires task context (exploration graph). This agent is not running inside a task, so the tool is unavailable. Use it within a task or use cross-task tools with task_id, such as get_task_node_detail/list_task_findings/get_task_graph.")), nil
+			return t.refuseOutsideTask(ctx, name), nil
 		}
 		return run(ctx, in)
 	}
+}
+
+// toolUseIDOf safely reads the per-call tool_use identity (nil-safe for direct
+// invocations such as catalog seeding, which pass no ToolContext; the empty ID
+// leaves a terminal proof unattributed and never gating inference).
+func toolUseIDOf(tc *actool.ToolContext) string {
+	if tc == nil {
+		return ""
+	}
+	return tc.ToolUseID
 }
 
 // refuseOutsideTask is the shared no-exploration-store refusal (see needExploration).
@@ -588,6 +598,11 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			}
 		}
 	}
+	ws, err := t.outputWithdrawals()
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	ws.annotate(out, t.language)
 	return out
 }
 
@@ -1009,7 +1024,7 @@ func (t *ToolSet) listFacts() actool.CoreTool {
 			if hasMore && len(f) > 0 {
 				res["next_before"] = f[len(f)-1].ID // Pass this cursor to retrieve the next, older page.
 			}
-			return jsonResult(res)
+			return t.withdrawnResult(res)
 		})
 }
 
@@ -1051,7 +1066,7 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 			if err := t.ts.PopulateFindingTrafficIDs([]*db.Node{n}); err != nil {
 				return actool.Errorf(locale.ErrorMessage(locale.FromContext(ctx), err)), nil
 			}
-			return jsonResult(n) // full payload incl. detail / evidence, plus explicit finding IDs
+			return t.withdrawnResult(n) // full payload incl. detail / evidence, plus explicit finding IDs
 		})
 }
 
@@ -1225,8 +1240,9 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf(locale.Text(locale.FromContext(ctx), "evidence_id must be a fact/finding in this task or a directly associated task")), nil
 			}
-			_ = t.ts.Link(ev, db.RelProves, goal)
-			_ = t.ts.SetNodeState(goal, "met")
+			if err := t.ts.ProveGoal(goal, ev); err != nil {
+				return actool.Errorf(locale.ErrorMessage(locale.FromContext(ctx), err)), nil
+			}
 			// After each prove_goal, check whether all goals are met and set GoalMet
 			// automatically, without requiring an explicit goal_met call from the model.
 			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
@@ -1238,23 +1254,13 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 					}
 				}
 				if allMet {
-					t.GoalMet = true
-					t.Reason = fmt.Sprintf(locale.Text(locale.FromContext(ctx), "All %d goals are met (last triggered by goal %d)"), len(goals), goal)
+					t.markGoalMet(fmt.Sprintf(locale.Text(locale.FromContext(ctx), "All %d goals are met (last triggered by goal %d)"), len(goals), goal))
+					t.markTerminalProof(toolUseIDOf(tc)) // bind to the ORIGINATING call (terminal_proof.go)
 					return actool.Text(fmt.Sprintf(locale.Text(locale.FromContext(ctx), "goal %d marked met; all task objectives are achieved and the task completes automatically"), goal)), nil
 				}
 			}
 			return actool.Text(fmt.Sprintf("goal %d marked met", goal)), nil
 		})
-}
-
-// toolUseIDOf safely reads the per-call tool_use identity (nil-safe for direct
-// invocations such as catalog seeding, which pass no ToolContext; the empty ID
-// leaves a terminal proof unattributed and never gating inference).
-func toolUseIDOf(tc *actool.ToolContext) string {
-	if tc == nil {
-		return ""
-	}
-	return tc.ToolUseID
 }
 
 func (t *ToolSet) markGoalMet(reason string) {
@@ -1843,7 +1849,7 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 			}
 			if pick == nil {
 				if intentNode.Inherited {
-					return jsonResult(inheritedMap(map[string]any{
+					return t.withdrawnResult(inheritedMap(map[string]any{
 						"intent_id": id, "final_text": locale.Text(locale.FromContext(ctx), "(This worker has no output yet)"),
 					}, intentNode.SourceTaskID))
 				}
@@ -1860,7 +1866,7 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 			if intentNode.Inherited {
 				inheritedMap(result, intentNode.SourceTaskID)
 			}
-			return jsonResult(result)
+			return t.withdrawnResult(result)
 		})
 }
 
@@ -1970,7 +1976,7 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 				if intentNode.Inherited {
 					inheritedMap(result, intentNode.SourceTaskID)
 				}
-				return jsonResult(result)
+				return t.withdrawnResult(result)
 			}
 			// ①/② summary stream, optionally keyword-filtered; 100-char summaries.
 			var acts []db.Activity
@@ -1987,7 +1993,7 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 			if intentNode.Inherited {
 				inheritedMap(result, intentNode.SourceTaskID)
 			}
-			return jsonResult(result)
+			return t.withdrawnResult(result)
 		})
 }
 

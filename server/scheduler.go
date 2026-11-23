@@ -97,7 +97,13 @@ func (sc *Scheduler) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if ctx.Err() != nil {
+				return
+			}
 			sc.s.reconcileConcurrency() // Fill available concurrency slots with queued tasks.
+			if ctx.Err() != nil {
+				return
+			}
 			sc.step()
 		}
 	}
@@ -143,6 +149,9 @@ func (sc *Scheduler) init(ctx context.Context) {
 		}
 		_ = sc.pg.SetSchedState(schedKeyLastTimeout, strconv.FormatInt(maxID, 10))
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	if sc.mustState(schedKeyLastToolCall) == "" {
 		var maxID int64
 		if evs, err := sc.pg.NewToolCallsSince(0); err == nil {
@@ -153,6 +162,9 @@ func (sc *Scheduler) init(ctx context.Context) {
 			}
 		}
 		_ = sc.pg.SetSchedState(schedKeyLastToolCall, strconv.FormatInt(maxID, 10))
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	if sc.mustState(schedKeyLastTaskCreate) == "" {
 		var maxID int64

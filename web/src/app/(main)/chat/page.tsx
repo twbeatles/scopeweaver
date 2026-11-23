@@ -1135,10 +1135,10 @@ export default function ChatPage() {
     const id = c ? Number(c) : NaN;
     if (Number.isFinite(id)) setSelectedId(id);
   }, []);
-  // Mirror the current selection into the URL (replaceState → no history spam). A
-  // selectedId with no matching conversation (e.g. a stale ?c=, or a just-created
-  // one before reloadConvs lands) simply renders the draft view — harmless — so we
-  // deliberately do NOT auto-clear it here (that raced new-conversation creation).
+  // Mirror the current selection into the URL (replaceState → no history spam).
+  // A missing selection falls back to a new draft only after the first list loads;
+  // while it is pending, keep the requested ID and show the loading state instead
+  // of an unrelated editable draft. Do NOT auto-clear it here: that raced creation.
   React.useEffect(() => {
     const url = new URL(window.location.href);
     if (selectedId != null) url.searchParams.set("c", String(selectedId));
@@ -1484,7 +1484,7 @@ export default function ChatPage() {
               onConvUpdated={reloadConvs}
               onNavigate={async ref=>{await reloadConvs();selectConversation(Number(ref.conversation_id))}}
             />
-          ) : sourceRequested ? (
+          ) : sourceRequested || (selectedId !== null && !convsLoaded) ? (
             <div role="status" className="p-6 text-sm text-muted-foreground">
               {convsLoaded ? swt("interface.m0128") : swt("interface.m0129")}
             </div>

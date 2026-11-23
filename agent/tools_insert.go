@@ -228,15 +228,20 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			var results []result
 			var errs []errEntry
 
-			// Load asset-gate rules once; a read failure skips evaluation rather than blocking insertion.
+			// Load all asset-gate rules before writing; unreadable rules must fail closed.
 			// Blocks combine global and task rules; allows are task-local.
-			blockRules, _ := t.as.ListAssetInterceptRules()
+			blockRules, err := t.as.ListAssetInterceptRules()
+			if err != nil {
+				return actool.Errorf(locale.ErrorMessage(locale.FromContext(ctx), err)), nil
+			}
 			var allowRules []db.AssetInterceptRule
 			if t.taskID > 0 {
-				if tb, ta, err := t.as.TaskInterceptRulesSplit(t.taskID); err == nil {
-					blockRules = append(blockRules, tb...)
-					allowRules = ta
+				tb, ta, err := t.as.TaskInterceptRulesSplit(t.taskID)
+				if err != nil {
+					return actool.Errorf(locale.ErrorMessage(locale.FromContext(ctx), err)), nil
 				}
+				blockRules = append(blockRules, tb...)
+				allowRules = ta
 			}
 
 			for i, item := range a.Assets {
@@ -425,16 +430,16 @@ func (t *ToolSet) addCompanyScope() actool.CoreTool {
 	)
 }
 
-// addTaskScope lets the plan agent add test scope to THE CURRENT TASK — the coverage
-// denominator and the task's authorization edge. Worker discoveries are auto-scoped
-// (precise host) by insertAssets; this tool is for DELIBERATELY WIDENING: pull a whole
-// root domain or whole company into scope, or add a specific subdomain / ip.
+// addTaskScope lets the plan agent record the current task's declared test scope
+// for prompt guidance, asset records, and coverage. Allowed worker discoveries
+// are auto-scoped as precise hosts by insertAssets; explicit additions must stay
+// within the minimum scope requested by the user and pass the asset gate.
 func (t *ToolSet) addTaskScope() actool.CoreTool {
 	return writeTool(
 		"add_task_scope",
-		locale.Text(t.language, "Add test scope to THIS task: its authorization boundary and asset coverage denominator.\n")+
+		locale.Text(t.language, "Add the declared test scope to THIS task: prompt guidance and an asset-record/coverage filter. It is not a network boundary; tool calls are stopped only by Interception rules.\n")+
 			locale.Text(t.language, "Kinds: company (all company assets), root_domain (entire domain and subdomains), subdomain (one exact hostname), ip, cidr, icp, keyword.\n")+
-			locale.Text(t.language, "Hosts encountered by workers are added automatically as exact subdomains. This tool explicitly expands authorized scope to a whole root domain/company or adds a specified subdomain/IP.\n")+
+			locale.Text(t.language, "Allowed hosts encountered by workers are added automatically as exact subdomains. Add only the minimum scope explicitly requested by the user; never expand it on your own.\n")+
 			locale.Text(t.language, "value: existing company name/ID for company; domain for root_domain/subdomain; IP/network for ip/cidr; registration number/company keyword for icp/keyword.\n")+
 			locale.Text(t.language, "Always provide an auditable reason. Use entries for multiple scope items."),
 		obj(map[string]any{
@@ -467,7 +472,7 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			var added []map[string]any
 			errs := map[string]string{}
 			for i, e := range items {
-				ts, err := t.as.AddAgentScope(t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, "agent")
+				ts, err := t.as.AddAgentScopeForLanguage(locale.FromContext(ctx), t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, "agent")
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue

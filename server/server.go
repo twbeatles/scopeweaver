@@ -75,6 +75,7 @@ type Server struct {
 	chatClosing   bool
 	chatWG        sync.WaitGroup
 	httpWG        sync.WaitGroup
+	chatDrainOnce sync.Once
 	chatDrainDone chan struct{}
 	chatDrainErr  error
 	// chatCancel holds the cancel func for each in-flight conversation run (keyed by
@@ -170,8 +171,10 @@ func newServer(ctx context.Context, m *Manager, skillDir string, dataDir string,
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
-		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+		provByProfile:  map[int64]*provEntry{},
+		taskAgents:     map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+	s.ctx = agent.WithCallbackOwner(s.ctx, s.reserveBackgroundWork)
+	s.llmHealth = newLLMHealthRegistry(m.pg, s.startBackgroundWork)
 	// Recovery must finish before any internal producer or task runtime starts.
 	if err := s.recoverChatControls(); err != nil {
 		return nil, fmt.Errorf("chat startup recovery: %w", err)
@@ -250,11 +253,11 @@ func newServer(ctx context.Context, m *Manager, skillDir string, dataDir string,
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
-		go s.evidenceStore().RunGC(s.ctx)
+		s.backgroundWG.Go(func() { s.evidenceStore().RunGC(s.ctx) })
 		s.seedPythonInterpreter() // Detect and store the Python interpreter for custom scripts at startup, only when empty.
 		// Finding notification delivery runs independently beside Scheduler: its three-second responsiveness
 		// differs from trigger scheduling, and a stuck delivery must not block agent triggers.
-		go newNotifier(s).Run(s.ctx)
+		s.backgroundWG.Go(func() { newNotifier(s).Run(s.ctx) })
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
 		s.backgroundWG.Go(s.discoverEmptyMCPsOnStartup)
@@ -280,11 +283,11 @@ func newServer(ctx context.Context, m *Manager, skillDir string, dataDir string,
 	if err := s.resumeChatControls(); err != nil {
 		log.Printf("[chat] %v", err)
 	}
-	go s.reconcileConcurrency()
+	s.backgroundWG.Go(s.reconcileConcurrency)
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM fallback approval judges commands that match no interception rule.
 	if m.pg != nil {
-		go newScheduler(s).Run(s.ctx) // Start admissions only after recovery and task restoration.
+		m.startScheduler(s) // Register ownership before launch, after recovery and task restoration.
 	}
 	return s, nil
 }
@@ -315,8 +318,14 @@ func (s *Server) restoreTaskRuntimes() {
 	// only the active UI task left other non-queued tasks counted as concurrency
 	// occupants without live loops, which could permanently block the persistent
 	// FIFO. Paused loops remain idle; queued tasks are admitted below as slots allow.
+	// This engine starts with no paused state. LoadExisting skips tasks the Manager
+	// already holds, so restore pause for every listed task before Run; otherwise a
+	// persisted pause would not stop their planner rounds (Pause is idempotent).
 	for _, t := range m.List() {
 		lifecycle := t.lifecycleSnapshot()
+		if lifecycle.Paused {
+			s.engine.Pause(t.ID, agent.AbortPausedOnReload)
+		}
 		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
 			s.engine.Run(s.ctx, t)
 		}
@@ -1245,10 +1254,7 @@ func restoreRerunIntent(t *Task, before *db.Node) error {
 	if t == nil || before == nil {
 		return locale.Errorf("missing intent rollback snapshot")
 	}
-	if before.State == "blocked" && before.BlockedReason != "" {
-		return t.Store.SetIntentBlockedReason(before.ID, before.BlockedReason)
-	}
-	return t.Store.SetIntentState(before.ID, before.State)
+	return t.Store.RestoreReopenedIntent(before.ID, before.State, before.BlockedReason)
 }
 
 func (s *Server) rerunIntent(w http.ResponseWriter, r *http.Request) {
@@ -1442,20 +1448,21 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 // testLLM makes a real minimal completion to verify the config works.
 func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		KeepAlive        string `json:"keep_alive"`
-		MaxConcurrent    int    `json:"llm_max_concurrent"`
-		ContextWindowK   int    `json:"context_window_k"`
-		MaxTokens        int    `json:"max_tokens"`
-		Provider         string `json:"provider"`
-		Model            string `json:"model"`
-		BaseURL          string `json:"base_url"`
-		Proxy            string `json:"proxy"`
-		APIKey           string `json:"api_key"`
-		ThinkingType     string `json:"thinking_type"`
-		ReasoningEffort  string `json:"reasoning_effort"`
-		ProfileID        *int64 `json:"profile_id"`         // Existing profile under test; an empty api_key uses its stored key.
-		Streaming        *bool  `json:"streaming"`          // Omitted means streaming, matching profile-save defaults.
-		SessionHeaderKey string `json:"session_header_key"` // Optional custom session header, also sent during testing with a fresh random session ID.
+		KeepAlive        string  `json:"keep_alive"`
+		MaxConcurrent    int     `json:"llm_max_concurrent"`
+		ContextWindowK   int     `json:"context_window_k"`
+		MaxTokens        int     `json:"max_tokens"`
+		MaxTokensField   *string `json:"max_tokens_field"`
+		Provider         string  `json:"provider"`
+		Model            string  `json:"model"`
+		BaseURL          string  `json:"base_url"`
+		Proxy            string  `json:"proxy"`
+		APIKey           string  `json:"api_key"`
+		ThinkingType     string  `json:"thinking_type"`
+		ReasoningEffort  string  `json:"reasoning_effort"`
+		ProfileID        *int64  `json:"profile_id"`         // Existing profile under test; an empty api_key uses its stored key.
+		Streaming        *bool   `json:"streaming"`          // Omitted means streaming, matching profile-save defaults.
+		SessionHeaderKey string  `json:"session_header_key"` // Optional custom session header, also sent during testing with a fresh random session ID.
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, err)
@@ -1468,6 +1475,9 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
+	if cfg.Provider() == opencodesdk.Format && req.MaxTokens > 0 {
+		cfg.MaxTokens = req.MaxTokens
+	}
 	// Test the profile's chosen transport mode so endpoints supporting only one mode fail here,
 	// rather than passing the test but failing in an actual conversation.
 	if req.Streaming != nil {
@@ -1481,9 +1491,10 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// API-key precedence: submitted form, specified profile's stored key, then global configuration.
 	// Stored keys never return to the browser; testing an existing profile may require reading its key from DB.
 	// Likewise, fall back to the stored custom session-header name when omitted by the form.
+	maxTokensField := req.MaxTokensField
 	if req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			if cfg.APIKey == "" && (cfg.Provider() != "ollama" || p.Format == "ollama") {
+			if cfg.APIKey == "" && (cfg.Provider() != "ollama" || p.Format == "ollama") && profileCredentialCompatible(cfg, p.Format, p.BaseURL) {
 				cfg.APIKey = p.APIKey
 			}
 			if cfg.SessionHeaderKey == "" {
@@ -1498,7 +1509,16 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 			if req.MaxTokens == 0 {
 				cfg.MaxTokens = p.MaxTokens
 			}
+			if maxTokensField == nil && cfg.Format == llm.FormatOpenAI && p.Format == "openai" {
+				saved := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, "", "")
+				if cfg.BaseURL == saved.BaseURL && cfg.Model == saved.Model {
+					maxTokensField = &p.MaxTokensField
+				}
+			}
 		}
+	}
+	if cfg.Format == llm.FormatOpenAI && maxTokensField != nil && *maxTokensField == llm.MaxTokensFieldCompletion {
+		cfg.MaxTokensField = llm.MaxTokensFieldCompletion
 	}
 	// Request and saved-profile headers take precedence over provider defaults.
 	if cfg.SessionHeaderKey == "" {
@@ -1512,7 +1532,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		// Reuse local gateway credentials only for the same format and transport target.
 		// Other local endpoints and native Ollama remain deliberately keyless.
 		sameGateway := cfg.Provider() != "ollama" && cfg.Format == active.Format && cfg.BaseURL == active.BaseURL && cfg.Proxy == active.Proxy
-		if !cfg.Ready() || sameGateway {
+		if profileCredentialCompatible(cfg, active.Provider(), active.BaseURL) && (cfg.Provider() == opencodesdk.Format || sameGateway || !cfg.Ready()) {
 			cfg.APIKey = active.APIKey
 		}
 	}
@@ -1663,6 +1683,12 @@ func (s *Server) validateTaskProfileIDs(ids []int64) error {
 	return nil
 }
 
+// HTTP Close can leave handlers running; serialize their background admission
+// with DrainChats so none can register after its Wait begins.
+func (s *Server) startBackgroundReconcile() {
+	s.startBackgroundWork(s.reconcileConcurrency)
+}
+
 func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 	t, ok := s.m.Task(r.PathValue("id"))
 	if !ok {
@@ -1698,7 +1724,7 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 	// live slot and postpones an unavailable task's pause/queue transition until
 	// the call returns; a nudge lets an idle running task resume promptly.
 	t.Notify()
-	go s.reconcileConcurrency()
+	s.startBackgroundReconcile()
 	llmState := t.llmStateSnapshot()
 	result := map[string]any{
 		"id": t.ID, "llm_profile_ids": llmState.ProfileIDs,
@@ -3612,7 +3638,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Reconcile immediately: disabling admits all queued tasks; raising the limit fills slots without waiting for a tick.
-		go s.reconcileConcurrency()
+		s.startBackgroundReconcile()
 	}
 	if req.PythonInterp != nil {
 		if err := s.m.pg.SetSetting(settingPythonInterp, strings.TrimSpace(*req.PythonInterp)); err != nil {
