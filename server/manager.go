@@ -839,11 +839,23 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 }
 
 func (m *Manager) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.stopSchedulers(ctx); err != nil {
+		// Keep the pool open while a scheduler still owns an in-flight query.
+		// The caller gets an explicit failure and may retry after it unwinds.
+		return err
+	}
+	m.enrich.Close()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.traffic != nil {
 		m.traffic.Close()
 	}
+	// Detach log persistence for exactly this manager's DB and JOIN the sink's
+	// async writer before the pool closes, so an in-flight InsertLog cannot hit
+	// "sql: database is closed" (CI PR40 failure).
+	logSink.StopDB(m.pg)
 	return m.pg.Close()
 }
 

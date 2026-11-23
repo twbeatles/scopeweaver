@@ -435,6 +435,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 				r.Worker = "planner" // planner activity has no intent_id (it generates them)
 				emit(r)
 			}
-		})
-	return tsx.GoalMet, tsx.Reason, err
+		}, observeProof)
+	goalMet, reason := tsx.goalResult()
+	return goalMet, reason, err
 }

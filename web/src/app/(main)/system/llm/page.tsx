@@ -785,7 +785,7 @@ function ProfileSheet({
             <Input
               id="p-base-url"
               className="font-mono"
-              placeholder="https://api.openai.com/v1"
+              placeholder={isSDK ? "http://127.0.0.1:4097" : "https://api.openai.com/v1"}
               value={baseUrl}
               onChange={(e) => { invalidateModels(); setBaseUrl(e.target.value); }}
             />

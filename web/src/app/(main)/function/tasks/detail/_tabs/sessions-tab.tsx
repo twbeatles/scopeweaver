@@ -348,6 +348,20 @@ function intentToSession(n: TaskNode): Session {
   };
 }
 
+// Only a finished worker's output is withdrawn from use: server/task_control.go sets
+// OutputDeletion for the terminal states alone, so for an unfinished worker the planner
+// is just told the intent will not execute. The soft-delete copy has to match that.
+function withdrawsOutput(status: string | undefined): boolean {
+  return status === "done" || status === "blocked" || status === "exhausted" || status === "stopped";
+}
+
+// Gap between the bold and plain fragments of the delete-confirmation sentence.
+// The zh/ja catalogs continue one phrase across those fragments, so a space would
+// land inside a word; en/ko/es need it between words.
+function fragmentGap(locale: string): string {
+  return locale === "zh-Hans" || locale === "zh-Hant" || locale === "ja" ? "" : " ";
+}
+
 function SessionItem({
   s,
   active,
