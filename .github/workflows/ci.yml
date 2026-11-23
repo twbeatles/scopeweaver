@@ -2,10 +2,30 @@ name: checks
 on:
   push:
     branches: [dev, main]
+    paths-ignore:
+      # Fork CI diet: docs-only changes need no runner minutes. Every entry
+      # below is inert for checks (verified: no job reads repo markdown,
+      # docs/, landing/, screenshots/ or .impeccable/). Keep triggering on
+      # anything else, including skills/, scripts/, locale data and shells.
+      - '**.md'
+      - 'docs/**'
+      - 'landing/**'
+      - 'screenshots/**'
+      - '.impeccable/**'
   pull_request:
     types: [opened, synchronize, reopened, edited]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'landing/**'
+      - 'screenshots/**'
+      - '.impeccable/**'
 permissions:
   contents: read
+# Superseded runs on the same ref waste fork minutes; only the latest matters.
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   branch-policy:
     runs-on: ubuntu-latest
