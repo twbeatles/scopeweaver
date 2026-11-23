@@ -108,6 +108,7 @@ type Engine struct {
 	// task operation. Once BeginDelete returns, every admitted writer is reflected
 	// in inflight and every later writer is rejected.
 	deleteMu sync.RWMutex
+	closing  bool // protected by deleteMu; shutdown permanently closes task admission
 
 	// Every long-lived task goroutine (planner, workers and deadline coordinator)
 	// runs under one task-scoped context. Successful deletion cancels that context,

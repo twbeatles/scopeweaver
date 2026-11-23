@@ -23,9 +23,11 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/chatstate"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmnet"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/locale"
+	"github.com/Autumn-27/artex/opencodesdk"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/llm"
@@ -72,6 +74,7 @@ type Server struct {
 	chatBusy      map[string]bool
 	chatClosing   bool
 	chatWG        sync.WaitGroup
+	httpWG        sync.WaitGroup
 	chatDrainDone chan struct{}
 	chatDrainErr  error
 	// chatCancel holds the cancel func for each in-flight conversation run (keyed by
@@ -125,7 +128,9 @@ type Server struct {
 	// channel coalesces enqueue bursts; the database remains the source of truth.
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
-	side        *sideQuestionState
+	// Startup and periodic DB users must finish before the manager closes stores.
+	backgroundWG sync.WaitGroup
+	side         *sideQuestionState
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -252,8 +257,8 @@ func newServer(ctx context.Context, m *Manager, skillDir string, dataDir string,
 		go newNotifier(s).Run(s.ctx)
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
-		go s.discoverEmptyMCPsOnStartup()
-		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
+		s.backgroundWG.Go(s.discoverEmptyMCPsOnStartup)
+		logSink.SetDB(ctx, m.pg, &s.backgroundWG) // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.
 	if cfg, ok := s.loadLLMConfig(); ok {
@@ -262,7 +267,7 @@ func newServer(ctx context.Context, m *Manager, skillDir string, dataDir string,
 		} else {
 			log.Printf("[engine] LLM configured from DB: %s / %s", cfg.Provider(), cfg.Model)
 		}
-	} else if cfg, ok := agent.FromEnv(); ok {
+	} else if cfg, ok := s.environmentLLMFallback(); ok {
 		if err := s.applyLLM(cfg); err != nil {
 			log.Printf("[engine] env provider init failed — engine idle: %v", err)
 		} else {
@@ -424,6 +429,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 func (s *Server) reapplyActiveProfile() {
 	cfg, ok := s.loadLLMConfig()
 	if !ok {
+		s.clearUnavailableSDKFallback(cfg)
 		return
 	}
 	if err := s.applyLLM(cfg); err != nil {
@@ -993,7 +999,7 @@ func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
-	return root
+	return s.trackHTTP(root)
 }
 
 // --- handlers ---
@@ -1357,7 +1363,15 @@ func (s *Server) getLLM(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// setLLM configures the LLM at runtime. A blank api_key keeps the existing key.
+// profileCredentialCompatible applies the endpoint scope of a stored credential.
+func profileCredentialCompatible(cfg agent.Config, storedFormat, storedURL string) bool {
+	if cfg.Provider() == opencodesdk.Format || storedFormat == opencodesdk.Format {
+		return cfg.Provider() == opencodesdk.Format && storedFormat == opencodesdk.Format && opencodesdk.SameEndpoint(cfg.BaseURL, storedURL)
+	}
+	return !llmnet.CrossesCheaperInferenceOrigin(storedURL, cfg.BaseURL)
+}
+
+// setLLM configures the LLM at runtime. A blank api_key keeps a compatible active key.
 func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		KeepAlive       string  `json:"keep_alive"`
@@ -1391,7 +1405,10 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	}
 	if cfg.APIKey == "" && !cfg.Ready() {
 		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey // keep existing key if not re-entered
+		active := s.llmCfg
+		if profileCredentialCompatible(cfg, active.Provider(), active.BaseURL) {
+			cfg.APIKey = active.APIKey
+		}
 		s.cfgMu.Unlock()
 	}
 	if !cfg.Ready() {

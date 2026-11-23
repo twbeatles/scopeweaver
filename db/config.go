@@ -7,6 +7,8 @@ import (
 	"github.com/Autumn-27/artex/llmnet"
 	"github.com/Autumn-27/artex/locale"
 	"time"
+
+	"github.com/Autumn-27/artex/opencodesdk"
 )
 
 // ---------- LLM profiles ----------
@@ -161,7 +163,13 @@ ORDER BY is_default DESC, priority DESC, id ASC`)
 
 // SaveProfile inserts (id==0) or updates a profile. Empty apiKey on update keeps existing.
 func (d *DB) SaveProfile(p *LLMProfile) (int64, error) {
+	if p.Format == opencodesdk.Format && !opencodesdk.ValidModel(p.Model) {
+		return 0, locale.NewError("OpenCode SDK model must be providerID/modelID")
+	}
 	hint := p.APIKeyHint
+	if p.APIKey != "" {
+		hint = ""
+	}
 	if len(p.APIKey) >= 4 {
 		hint = "…" + p.APIKey[len(p.APIKey)-4:]
 	}
@@ -188,6 +196,7 @@ VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,$9,$
 
 var (
 	ErrActiveLLMProfileDelete      = locale.NewError("cannot delete the active LLM profile; activate another profile first")
+	ErrActiveLLMProfileKeyRequired = locale.NewError("API key was not provided")
 	ErrLLMProfileReferencesChanged = locale.NewError("LLM profile references changed while deleting; retry the request")
 	ErrLLMProfileNotFound          = locale.NewError("LLM profile not found")
 )

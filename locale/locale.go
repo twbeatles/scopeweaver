@@ -25,8 +25,14 @@ const (
 	En Lang = "en"
 	// Ko is Korean, the selectable alternative.
 	Ko Lang = "ko"
-	// ZhHans is Simplified Chinese. Traditional Chinese is not shipped.
+	// ZhHans is Simplified Chinese.
 	ZhHans Lang = "zh-Hans"
+	// ZhHant is Traditional Chinese.
+	ZhHant Lang = "zh-Hant"
+	// Ja is Japanese.
+	Ja Lang = "ja"
+	// Es is Spanish.
+	Es Lang = "es"
 )
 
 // Default is the fallback language when nothing else is negotiated.

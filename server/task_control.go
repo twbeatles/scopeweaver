@@ -222,7 +222,7 @@ func (s *Server) applyIntentControl(ctx context.Context, t *Task, iid int64, act
 		}
 		summary := intentSummaryOf(node)
 		if mode == "hard" {
-			cleanup, err := t.Store.CancelIntent(iid)
+			cleanup, err := t.Store.CancelIntent(iid, node.State)
 			if err != nil {
 				return out, err
 			}
@@ -231,7 +231,7 @@ func (s *Server) applyIntentControl(ctx context.Context, t *Task, iid int64, act
 			out.Deleted = &cleanup
 			out.State = "" // The node is deleted; the frontend uses Deleted to remove it from the list.
 		} else {
-			if _, err := t.Store.SoftDeleteIntent(iid, reason); err != nil {
+			if _, err := t.Store.SoftDeleteIntent(iid, node.State, reason); err != nil {
 				return out, err
 			}
 			s.cancelWorkerSide(t.ID, t.ExpID, iid)

@@ -26,6 +26,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/locale"
+	"github.com/Autumn-27/artex/opencodesdk"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
 )
@@ -1960,6 +1961,17 @@ func (s *Server) pgActivateProfile(w http.ResponseWriter, r *http.Request) {
 	if err := decode(r, &body); err != nil {
 		writeError(w, 400, err)
 		return
+	}
+	if p, err := pg.ProfileByID(body.ID); err == nil && p != nil && p.Format == opencodesdk.Format {
+		if !opencodesdk.ValidModel(p.Model) {
+			writeError(w, 400, locale.NewError("OpenCode SDK model must be providerID/modelID"))
+			return
+		}
+		cfg := s.applyLLMPolicy(agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy))
+		if _, err = cfg.NewProvider(); err != nil {
+			writeError(w, 400, err)
+			return
+		}
 	}
 	if err := pg.SetActiveProfile(body.ID); err != nil {
 		writeError(w, 500, err)

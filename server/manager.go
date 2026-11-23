@@ -231,7 +231,12 @@ type Manager struct {
 	// this outer write lock an older request could commit first and publish last.
 	taskStateMu sync.Mutex
 	mu          sync.RWMutex
-	tasks       map[string]*Task
+	// schedulerMu closes registration before waiting; scheduler work can need mu.
+	schedulerMu      sync.Mutex
+	schedulerCancels []context.CancelFunc
+	schedulerWG      sync.WaitGroup
+	schedulerDone    chan struct{}
+	tasks            map[string]*Task
 	active      string
 	trafficOn   bool // Traffic capture flag (off by default; settings.traffic_capture).
 	llmRecOn    bool // LLM recording flag (off by default; settings.llm_record).
@@ -839,11 +844,23 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 }
 
 func (m *Manager) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.stopSchedulers(ctx); err != nil {
+		// Keep the pool open while a scheduler still owns an in-flight query.
+		// The caller gets an explicit failure and may retry after it unwinds.
+		return err
+	}
+	m.enrich.Close()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.traffic != nil {
 		m.traffic.Close()
 	}
+	// Detach log persistence for exactly this manager's DB and JOIN the sink's
+	// async writer before the pool closes, so an in-flight InsertLog cannot hit
+	// "sql: database is closed" (CI PR40 failure).
+	logSink.StopDB(m.pg)
 	return m.pg.Close()
 }
 

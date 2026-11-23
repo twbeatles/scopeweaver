@@ -12,7 +12,7 @@ import { translate as swt } from "@/i18n/runtime";
  * - During local development, run manually after adding any new theme preset:
  *     npm run generate:presets
  * - Ensure that each new CSS preset includes `label:` and `value:` comments.
- * - This generation step is currently automated using a Husky pre-push hook.
+ * - The Husky pre-commit hook runs this on staged theme inputs.
  * - You may optionally integrate it directly into a build step if preferred.
  */
 
@@ -29,7 +29,10 @@ if (!fs.existsSync(presetDir)) {
 
 const outputPath = path.resolve(__dirname, "../lib/preferences/theme.ts");
 
-const files = fs.readdirSync(presetDir).filter((file) => file.endsWith(".css"));
+const files = fs
+  .readdirSync(presetDir)
+  .filter((file) => file.endsWith(".css"))
+  .sort();
 
 if (files.length === 0) {
   console.warn("⚠️ No preset CSS files found. Only default preset will be included.");
@@ -91,9 +94,32 @@ const defaultPrimary = {
 
 presets.unshift({ get label() { return swt("english.e188"); }, value: "default", primary: defaultPrimary });
 
+const localizedLabels = new Map([
+  ["default", "english.e188"],
+  ["brutalist", "english.e189"],
+  ["soft-pop", "english.e190"],
+  ["tangerine", "english.e191"],
+]);
+const presetDefinitions = presets.map(({ label, value, primary }) => {
+  const labelKey = localizedLabels.get(value);
+  const labelProperty = labelKey
+    ? `get label() { return swt(${JSON.stringify(labelKey)}); }`
+    : `label: ${JSON.stringify(label)}`;
+  return `  {
+    ${labelProperty},
+    value: ${JSON.stringify(value)},
+    primary: {
+      light: ${JSON.stringify(primary.light)},
+      dark: ${JSON.stringify(primary.dark)},
+    },
+  },`;
+});
+
 const generatedBlock = `// --- generated:themePresets:start ---
 
-export const THEME_PRESET_OPTIONS = ${JSON.stringify(presets, null, 2)} as const;
+export const THEME_PRESET_OPTIONS = [
+${presetDefinitions.join("\n")}
+] as const;
 
 export const THEME_PRESET_VALUES = THEME_PRESET_OPTIONS.map((p) => p.value);
 
@@ -110,12 +136,10 @@ const updated = fileContent.replace(
 
 function main() {
   const biomeBin = require.resolve("@biomejs/biome/bin/biome");
-  const formatted = execFileSync(process.execPath, [biomeBin, "format", "--stdin-file-path", outputPath], {
-    input: updated,
-    encoding: "utf8",
-  });
-
-  if (formatted === fileContent) {
+  const format = (input: string) =>
+    execFileSync(process.execPath, [biomeBin, "format", "--stdin-file-path", outputPath], { input, encoding: "utf8" });
+  const formatted = format(updated);
+  if (formatted === fileContent || formatted === format(fileContent)) {
     console.log("ℹ️  No changes in theme.ts");
     return;
   }

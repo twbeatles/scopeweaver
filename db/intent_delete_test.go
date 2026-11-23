@@ -1,6 +1,9 @@
 package db
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // mustIntent / mustNode / mustLink are terse builders for the delete-cascade tests.
 func mustIntent(t *testing.T, es *ExplorationStore, summary string) int64 {
@@ -55,7 +58,7 @@ func TestSoftDeleteIntent(t *testing.T) {
 	if err := es.SetIntentState(intent, "paused"); err != nil {
 		t.Fatal(err)
 	}
-	summary, err := es.SoftDeleteIntent(intent, "Wrong direction")
+	summary, err := es.SoftDeleteIntent(intent, "paused", "Wrong direction")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +74,7 @@ func TestSoftDeleteIntent(t *testing.T) {
 	}
 	// Pending (open) intents can also be soft-deleted.
 	openIntent := mustIntent(t, es, "Unclaimed intent")
-	if _, err := es.SoftDeleteIntent(openIntent, "Direction no longer needed"); err != nil {
+	if _, err := es.SoftDeleteIntent(openIntent, "open", "Direction no longer needed"); err != nil {
 		t.Fatalf("soft delete open intent: %v", err)
 	}
 	if n, err := es.GetNode(openIntent); err != nil || n == nil || n.State != StateIntentDeleted {
@@ -79,7 +82,7 @@ func TestSoftDeleteIntent(t *testing.T) {
 	}
 
 	// Already deleted and other unsupported states cannot be soft-deleted again.
-	if _, err := es.SoftDeleteIntent(intent, "Delete again"); err == nil {
+	if _, err := es.SoftDeleteIntent(intent, StateIntentDeleted, "Delete again"); !errors.Is(err, ErrIntentStateConflict) {
 		t.Fatal("soft-deleting an already-deleted intent unexpectedly succeeded")
 	}
 }
@@ -107,7 +110,7 @@ func TestHardDeleteCascadesExclusiveDescendants(t *testing.T) {
 	fact2 := mustNode(t, es, KindFact, "Fact 2")
 	mustLink(t, es, intent2, RelYields, fact2)
 
-	cleanup, err := es.CancelIntent(intent1)
+	cleanup, err := es.CancelIntent(intent1, "open")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +154,7 @@ func TestHardDeletePreservesSharedAndGoal(t *testing.T) {
 	intent2 := mustIntent(t, es, "Derived from shared fact")
 	mustLink(t, es, shared, RelDerivedFrom, intent2)
 
-	cleanup, err := es.CancelIntent(intent1)
+	cleanup, err := es.CancelIntent(intent1, "open")
 	if err != nil {
 		t.Fatal(err)
 	}
