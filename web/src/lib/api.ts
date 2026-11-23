@@ -964,12 +964,17 @@ export const api = {
     profile_id?: number,
     streaming = true, // Test the profile's actual transport mode so nonstreaming failures are caught before conversations.
     session_header_key = "", // Nonempty sends this custom header on test requests with a one-time session ID.
-    // Native Ollama uses these for num_ctx, residency and num_predict; other formats ignore them.
-    native: { context_window_k?: number; keep_alive?: string; max_tokens?: number; llm_max_concurrent?: number } = {},
+    options: {
+      context_window_k?: number;
+      keep_alive?: string;
+      max_tokens?: number;
+      max_tokens_field?: string;
+      llm_max_concurrent?: number;
+    } = {},
   ) =>
     // reply contains truncated actual model output; an entirely empty response fails the backend test.
     post<LLMTestResult>("/llm/test", {
-      ...native,
+      ...options,
       provider,
       model,
       base_url,

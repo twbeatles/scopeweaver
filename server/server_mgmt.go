@@ -1836,6 +1836,20 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := body.LLMProfile
+	if p.Format == opencodesdk.Format && !opencodesdk.ValidModel(p.Model) {
+		writeError(w, 400, locale.NewError("OpenCode SDK model must be providerID/modelID"))
+		return
+	}
+	if p.Format == opencodesdk.Format {
+		if _, err := opencodesdk.NormalizeBaseURL(p.BaseURL); err != nil {
+			writeError(w, 400, err)
+			return
+		}
+		if p.Proxy != "" {
+			writeError(w, 400, locale.NewError("OpenCode SDK bridge proxy settings are not allowed"))
+			return
+		}
+	}
 	p.APIKey = body.APIKey
 	p.Streaming = body.Streaming == nil || *body.Streaming
 	// Negative output limits are meaningless; normalize to zero, omitting the request field. Field-name selection
@@ -1852,6 +1866,10 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		p.MaxTokensField = ""
 	}
 	id, err := pg.SaveProfile(&p)
+	if errors.Is(err, db.ErrActiveLLMProfileKeyRequired) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if err != nil {
 		writeError(w, 500, err)
 		return
@@ -2036,12 +2054,16 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	apiKey := strings.TrimSpace(req.APIKey)
 	if apiKey == "" && req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			if req.Provider != "ollama" || p.Format == "ollama" {
+			if (req.Provider != "ollama" || p.Format == "ollama") && profileCredentialCompatible(agent.ConfigFrom(req.Provider, "", req.BaseURL, "", req.Proxy), p.Format, p.BaseURL) {
 				apiKey = p.APIKey
 			}
 		}
 	}
 	cfg := s.applyLLMPolicy(agent.ConfigFrom(req.Provider, "", req.BaseURL, apiKey, req.Proxy))
+	if cfg.Provider() == opencodesdk.Format {
+		s.listOpenCodeSDKModels(w, r, cfg)
+		return
+	}
 	if req.Provider == "ollama" {
 		s.listOllamaModels(w, r, cfg)
 		return

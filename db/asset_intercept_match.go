@@ -51,7 +51,7 @@ func (r AssetInterceptRule) ReasonForLanguage(lang locale.Lang) string {
 }
 
 // matchOne tests one enabled rule against domain/IP/URL candidates and returns the matching value.
-func matchOne(r AssetInterceptRule, domains, ips, urls []string) (string, bool) {
+func matchOne(r AssetInterceptRule, domains, ips, urls []string, allow bool) (string, bool) {
 	p := strings.TrimSpace(r.Pattern)
 	if p == "" {
 		return "", false
@@ -76,9 +76,17 @@ func matchOne(r AssetInterceptRule, domains, ips, urls []string) (string, bool) 
 			}
 		}
 	case "fuzzy_domain":
-		lp := strings.ToLower(p)
+		lp := strings.Trim(strings.ToLower(p), ".")
+		if lp == "" {
+			return "", false
+		}
 		for _, d := range domains {
-			if d != "" && strings.Contains(strings.ToLower(d), lp) {
+			domain := strings.Trim(strings.ToLower(strings.TrimSpace(d)), ".")
+			matched := strings.Contains("."+domain+".", "."+lp+".")
+			if allow {
+				matched = domain == lp || strings.HasSuffix(domain, "."+lp)
+			}
+			if matched {
 				return d, true
 			}
 		}
@@ -112,18 +120,26 @@ func matchOne(r AssetInterceptRule, domains, ips, urls []string) (string, bool) 
 // MatchAssetInterceptRules returns the first enabled matching rule and the matched value.
 // insert_assets uses this with raw input (assetInputItem not yet persisted).
 func MatchAssetInterceptRules(rules []AssetInterceptRule, domains, ips, urls []string) (AssetInterceptRule, string, bool) {
+	return matchAssetInterceptRules(rules, domains, domains, ips, urls, false)
+}
+
+func matchAssetInterceptRules(rules []AssetInterceptRule, domains, exactDomains, ips, urls []string, allow bool) (AssetInterceptRule, string, bool) {
 	for _, r := range rules {
 		if !r.Enabled {
 			continue
 		}
-		if v, ok := matchOne(r, domains, ips, urls); ok {
+		ruleDomains := domains
+		if allow && r.Kind == "exact_domain" {
+			ruleDomains = exactDomains
+		}
+		if v, ok := matchOne(r, ruleDomains, ips, urls, allow); ok {
 			return r, v, true
 		}
 	}
 	return AssetInterceptRule{}, "", false
 }
 
-// interceptCandidates extracts domain/IP/URL candidates from a persisted asset.
+// interceptCandidates extracts actual domain/IP/URL candidates from a persisted asset.
 // URL hosts are classified so domain/IP rules also cover service assets that contain only a URL.
 func (a *Asset) interceptCandidates() (domains, ips, urls []string) {
 	add := func(dst *[]string, s string) {
@@ -132,7 +148,6 @@ func (a *Asset) interceptCandidates() (domains, ips, urls []string) {
 		}
 	}
 	add(&domains, a.Domain)
-	add(&domains, a.RootDomain)
 	for _, d := range a.BoundDomains {
 		add(&domains, d)
 	}
@@ -200,15 +215,29 @@ func EvaluateAssetGate(blockRules, allowRules []AssetInterceptRule, domains, ips
 
 // EvaluateAssetGateForLanguage changes message language without changing rule evaluation.
 func EvaluateAssetGateForLanguage(lang locale.Lang, blockRules, allowRules []AssetInterceptRule, domains, ips, urls []string) AssetGateDecision {
+	return evaluateAssetGateForCandidates(lang, blockRules, allowRules, domains, domains, ips, urls)
+}
+
+func evaluateAssetGateForCandidates(lang locale.Lang, blockRules, allowRules []AssetInterceptRule, domains, exactDomains, ips, urls []string) AssetGateDecision {
 	if rule, _, ok := MatchAssetInterceptRules(blockRules, domains, ips, urls); ok {
 		return AssetGateDecision{Allowed: false, Reason: rule.ReasonForLanguage(lang)}
 	}
 	if hasEnabledRule(allowRules) {
-		if _, _, ok := MatchAssetInterceptRules(allowRules, domains, ips, urls); !ok {
+		if _, _, ok := matchAssetInterceptRules(allowRules, domains, exactDomains, ips, urls, true); !ok {
 			return AssetGateDecision{Allowed: false, Reason: locale.Text(lang, "Testing is not allowed outside the task's allowed scope (allowlist)")}
 		}
 	}
 	return AssetGateDecision{Allowed: true}
+}
+
+func (a *Asset) evaluateAssetGateForLanguage(lang locale.Lang, blockRules, allowRules []AssetInterceptRule) AssetGateDecision {
+	domains, ips, urls := a.interceptCandidates()
+	// Preserve root-domain matching except for exact-domain allow rules, which require an actual host.
+	allDomains := domains
+	if root := strings.TrimSpace(a.RootDomain); root != "" {
+		allDomains = append(allDomains, root)
+	}
+	return evaluateAssetGateForCandidates(lang, blockRules, allowRules, allDomains, domains, ips, urls)
 }
 
 // AssetInterceptHit describes an asset rejected by a block match or an allowlist miss.
@@ -266,8 +295,7 @@ func (s *AssetStore) CheckAssetsInterceptForLanguage(lang locale.Lang, taskID in
 	}
 	var hits []AssetInterceptHit
 	for _, a := range assets {
-		domains, ips, urls := a.interceptCandidates()
-		if d := EvaluateAssetGateForLanguage(lang, blockRules, allowRules, domains, ips, urls); !d.Allowed {
+		if d := a.evaluateAssetGateForLanguage(lang, blockRules, allowRules); !d.Allowed {
 			hits = append(hits, AssetInterceptHit{Asset: a, Reason: d.Reason})
 		}
 	}

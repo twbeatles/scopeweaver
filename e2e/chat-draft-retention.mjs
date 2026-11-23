@@ -1,4 +1,5 @@
 import { request } from "playwright";
+import { writeFile } from "node:fs/promises";
 import { en } from "../web/src/i18n/messages/interface.ts";
 import { waitChatState } from "./chat-controls.mjs";
 
@@ -23,9 +24,140 @@ async function attachDocument(page, input, name) {
   await page.waitForFunction(() => !document.querySelector("[data-attachment-id] .animate-spin"));
 }
 
+async function captureSelectedLoading(page, name) {
+  const dir = process.env.SCOPEWEAVER_E2E_ARTIFACTS;
+  if (!dir) return;
+  await writeFile(`${dir}/${name}.html`, await page.content(), { mode: 0o600 });
+  await page.screenshot({ path: `${dir}/${name}.png` });
+}
+
+// Hold an actual successful list response; the optional first failure exercises
+// the existing poll retry without manufacturing conversation data.
+async function holdConversationList(page, failFirst = false) {
+  let releaseGate, resolveHeld;
+  let released = false;
+  const gate = new Promise(resolve => { releaseGate = resolve; });
+  const held = new Promise(resolve => { resolveHeld = resolve; });
+  await page.route(url => url.pathname === "/api/conversations", async route => {
+    if (route.request().method() !== "GET") return route.continue();
+    if (failFirst) {
+      failFirst = false;
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "List unavailable fixture" }) });
+      return;
+    }
+    const response = await route.fetch();
+    const body = await response.json();
+    resolveHeld({ status: response.status(), ids: body.conversations.map(item => item.id) });
+    if (!released) await gate;
+    await route.fulfill({ response });
+  });
+  return { held, release: () => { released = true; releaseGate(); } };
+}
+
+async function runSelectedConversationLoadingChecks({ base, token, fixture, step, check, openPage }, api) {
+  const calls = await fixture.calls();
+  for (const { width, failFirst } of [{ width: 1440, failFirst: false }, { width: 390, failFirst: false }, { width: 1440, failFirst: true }]) {
+    const created = await api.post("/api/conversations", { data: { agent_key: "auto", title: "Selected conversation loading" } });
+    check(created.ok(), await created.text());
+    const conversation = await created.json();
+    const page = await openPage("en", token);
+    await page.setViewportSize({ width, height: 900 });
+    const list = await holdConversationList(page, failFirst);
+    let releaseControls, resolveControls;
+    const controlsGate = new Promise(resolve => { releaseControls = resolve; });
+    const controlsSeen = new Promise(resolve => { resolveControls = resolve; });
+    const controlsPath = `/api/conversations/${conversation.id}/controls`;
+    await page.route(url => url.pathname === controlsPath, async route => {
+      if (route.request().method() !== "GET") return route.continue();
+      resolveControls();
+      await controlsGate;
+      await route.continue();
+    });
+    try {
+      await step(`[en/${width}/standalone] selected conversation blocks fallback input during ${failFirst ? "list retry" : "list loading"}`, async () => {
+        await page.goto(`${base}/chat?c=${conversation.id}`);
+        const held = await bounded(list.held, "real conversation list response");
+        check(held.status === 200 && held.ids.includes(conversation.id), "held list does not contain the requested real conversation");
+        await page.getByRole("status").filter({ hasText: en.m0129 }).waitFor();
+        check(await page.locator("textarea[data-chat-draft]").count() === 0, "requested conversation exposes a fallback composer before its list resolves");
+        await captureSelectedLoading(page, `selected-loading-${width}-${failFirst ? "retry" : "initial"}`);
+        const delivered = page.waitForResponse(response => new URL(response.url()).pathname === "/api/conversations" && response.ok());
+        list.release();
+        await delivered;
+        const input = page.locator(`textarea[data-chat-draft="chat:conv-${conversation.id}"]`);
+        await input.waitFor();
+        await bounded(controlsSeen, "initial controls GET");
+        const original = await input.elementHandle();
+        const text = "draft survives mounted controls hydration";
+        await input.fill(text);
+        check(await page.locator("[data-chat-queue]").count() === 0, "initial controls response escaped its gate");
+        releaseControls();
+        await page.locator("[data-chat-queue]").waitFor();
+        check(await input.evaluate((node, previous) => node === previous, original), "controls hydration replaced the mounted conversation input");
+        check(await input.inputValue() === text, "controls hydration lost the existing-conversation draft");
+        check(!await input.isDisabled(), "hydrated conversation composer is disabled");
+        check(await page.getByRole("button", { name: en.m0073, exact: true }).isEnabled(), "hydrated conversation cannot send its draft");
+        await input.press("End");
+        await input.press("!");
+        check(await input.inputValue() === `${text}!`, "conversation composer cannot accept keyboard input after hydration");
+        await captureSelectedLoading(page, `selected-composer-${width}-${failFirst ? "retry" : "initial"}`);
+      });
+    } finally {
+      list.release();
+      releaseControls();
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+      await page.context().close();
+      check((await api.delete(`/api/conversations/${conversation.id}`)).ok(), "selected loading conversation cleanup failed");
+    }
+  }
+
+  for (const { name, query, loading, missing } of [
+    { name: "new chat", query: "", loading: false, missing: false },
+    { name: "invalid selection", query: "?c=not-a-number", loading: false, missing: false },
+    { name: "missing selection", query: "?c=2147483647", loading: true, missing: false },
+    { name: "missing approval source", query: "?c=2147483647&approval=fixture", loading: true, missing: true },
+  ]) {
+    const page = await openPage("en", token);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const list = await holdConversationList(page);
+    try {
+      await step(`[en/1440/standalone] ${name} preserves its initial composer policy`, async () => {
+        await page.goto(`${base}/chat${query}`);
+        const held = await bounded(list.held, "fallback-policy conversation list");
+        check(held.status === 200 && held.ids.length === 0, "fallback-policy fixture must use the real empty conversation list");
+        const input = page.locator('textarea[data-chat-draft="chat:draft"]');
+        const text = `${name} draft`;
+        if (loading) {
+          await page.getByRole("status").filter({ hasText: en.m0129 }).waitFor();
+          check(await page.locator("textarea[data-chat-draft]").count() === 0, "pending requested selection exposes a new-chat composer");
+        } else {
+          await input.fill(text);
+        }
+        const delivered = page.waitForResponse(response => new URL(response.url()).pathname === "/api/conversations" && response.ok());
+        list.release();
+        await delivered;
+        if (missing) {
+          await page.getByRole("status").filter({ hasText: en.m0128 }).waitFor();
+          check(await page.locator("textarea[data-chat-draft]").count() === 0, "missing approval source became an editable new chat");
+        } else {
+          await input.waitFor();
+          if (loading) await input.fill(text);
+          check(await input.inputValue() === text && !await input.isDisabled(), "new-chat fallback lost its independent editable draft");
+        }
+      });
+    } finally {
+      list.release();
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+      await page.context().close();
+    }
+  }
+  check(await fixture.calls() === calls, "conversation loading checks called the model provider");
+}
+
 export async function runChatDraftRetentionChecks({ base, token, fixture, step, check, openPage }) {
   const api = await request.newContext({ baseURL: base, timeout: 5000, extraHTTPHeaders: { Authorization: `Bearer ${token}` } });
   try {
+    await runSelectedConversationLoadingChecks({ base, token, fixture, step, check, openPage }, api);
     const created = await api.post("/api/tasks", { data: { description: "Segment draft retention", goal: "Keep idle", seed_first_intent: false } });
     check(created.ok(), await created.text());
     const task = await created.json();
@@ -80,7 +212,9 @@ export async function runChatDraftRetentionChecks({ base, token, fixture, step, 
           await step(`[en/1440/standalone] pending ${mode} ${outcome} protects composer and payload`, async () => {
             console.log(`START pending ${mode} ${outcome}`);
             await page.goto(`${base}/chat?c=${conversation.id}`);
-            const input = page.locator("textarea[data-chat-draft]").first();
+            const input = page.locator(`textarea[data-chat-draft="chat:conv-${conversation.id}"]`);
+            await input.waitFor();
+            await page.locator("[data-chat-queue]").waitFor();
             phase = "start held run";
             await fixture.holdNext();
             await input.fill("hold the active run");

@@ -1,6 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyLLMProfilePreset, getLLMProfilePreset, isOllamaPreset, selectInstalledOllamaModel, LLM_PROFILE_PRESET_IDS } from "./llm-profile-presets.ts";
+import { applyLLMProfilePreset, canReuseSDKBridgeToken, crossesCheaperInferenceBoundary, getLLMProfilePreset, isOllamaPreset, requiresExplicitGatewayKey, selectInstalledOllamaModel, LLM_PROFILE_PRESET_IDS } from "./llm-profile-presets.ts";
+
+test("OpenCode SDK template isolates bridge credentials and waits for explicit model discovery", () => {
+  const draft = Object.freeze({ name: "SDK", api_key: "unsaved-cloud-key", proxy: "http://proxy:8080", session_header_key: "x-opencode-session", streaming: false, rate_per_minute: 7 });
+  const next = applyLLMProfilePreset(draft, "opencode-sdk");
+  assert.deepEqual(getLLMProfilePreset("opencode-sdk"), {
+    format: "opencode-sdk", base_url: "http://127.0.0.1:4097", model: "", api_key: "", proxy: "", session_header_key: "", streaming: true,
+    thinking_type: "", reasoning_effort: "", context_window_k: 0, max_tokens: 0, max_tokens_field: "",
+  });
+  assert.equal(next.name, draft.name);
+  assert.equal(next.rate_per_minute, draft.rate_per_minute);
+  for (const field of ["api_key", "proxy", "session_header_key", "model"]) assert.equal(next[field], "", field);
+  assert.equal(next.streaming, true);
+  assert.equal(draft.api_key, "unsaved-cloud-key");
+  assert.equal(isOllamaPreset("opencode-sdk"), false, "SDK discovery must not use automatic Ollama discovery");
+  assert.equal(applyLLMProfilePreset(next, "openai").api_key, "", "leaving SDK must not invent a cloud key");
+  assert.equal(applyLLMProfilePreset({ ...next, api_key: "bridge-token" }, "openai").api_key, "", "switching templates must not send a bridge token to a cloud provider");
+});
+
+test("saved bridge-token hints require the same SDK endpoint and never cross host aliases or formats", () => {
+  const profile = { format: "opencode-sdk", base_url: "http://127.0.0.1:4097/bridge/" };
+  assert.equal(canReuseSDKBridgeToken(profile, "opencode-sdk", " http://127.0.0.1:4097/bridge "), true);
+  for (const url of ["http://localhost:4097/bridge", "http://[::1]:4097/bridge", "http://2130706433:4097/bridge", "http://127.0.0.1:4098/bridge", "https://127.0.0.1:4097/bridge", "http://127.0.0.1:4097/other", "http://127.0.0.1:4097/bridge/a/../", "http://127.0.0.1:4097/bridge?token=x", "http://127.0.0.1:4097/bridge#x", "http://user@127.0.0.1:4097/bridge", "invalid", ""]) {
+    assert.equal(canReuseSDKBridgeToken(profile, "opencode-sdk", url), false, url);
+  }
+  for (const format of ["openai", "anthropic", "openai-responses", "ollama"]) {
+    assert.equal(canReuseSDKBridgeToken(profile, format, profile.base_url), false, format);
+    assert.equal(canReuseSDKBridgeToken({ ...profile, format }, "opencode-sdk", profile.base_url), false, format);
+  }
+  assert.equal(canReuseSDKBridgeToken(null, "opencode-sdk", profile.base_url), false);
+  assert.equal(canReuseSDKBridgeToken({ format: "opencode-sdk", base_url: "" }, "opencode-sdk", "http://127.0.0.1:4097/"), true, "blank SDK URLs use the default bridge root");
+});
 
 test("GLM templates distinguish billing endpoints and use the measured economy settings", () => {
   const general = getLLMProfilePreset("zai-general");
@@ -35,6 +66,8 @@ test("cloud economy templates fill the documented endpoint, model and opt-in out
     // The opencode-go gateway template deliberately fills effort max at the user's request
     // and the required x-opencode-session header (HTTP 400 MissingSessionID without it).
     "opencode-go": ["openai", "https://opencode.ai/zen/go/v1", "glm-5.3-flash", "", "max", "", "x-opencode-session"],
+    // The cheaper-inference gateway template omits effort (model default) and sends max_completion_tokens.
+    "cheaper-inference": ["openai", "https://api.cheaperinference.com/v1", "gpt-5.4-mini", "", "", "max_completion_tokens"],
   };
   for (const [id, [format, baseURL, model, thinking, effort, field, sessionHeader]] of Object.entries(expected)) {
     assert.ok(LLM_PROFILE_PRESET_IDS.includes(id), id);
@@ -56,6 +89,7 @@ test("cloud economy templates fill the documented endpoint, model and opt-in out
 test("cloud economy templates keep the entered key and preferences, and switching between them changes only template fields", () => {
   const draft = Object.freeze({ name: "Economy", api_key: "user-entered-key", proxy: "http://proxy:8080", session_header_key: "x-session", streaming: false, rate_per_minute: 7 });
   let previous = draft;
+  // The Cheaper Inference gateway is excluded: crossing into or out of it clears the key (tested below).
   for (const id of ["deepseek", "claude", "openai", "qwen", "kimi", "openrouter", "zai-general", "deepseek"]) {
     const next = applyLLMProfilePreset(previous, id);
     for (const key of Object.keys(draft)) assert.equal(next[key], draft[key], `${id} keeps ${key}`);
@@ -69,10 +103,63 @@ test("cloud economy templates keep the entered key and preferences, and switchin
   for (const key of ["name", "api_key", "proxy", "streaming", "rate_per_minute"]) assert.equal(oc[key], draft[key], `opencode-go keeps ${key}`);
   assert.equal(oc.session_header_key, "x-opencode-session", "opencode-go fills its required session header");
   assert.deepEqual({ ...oc }, { ...draft, ...getLLMProfilePreset("opencode-go") }, "opencode-go leaves no fields from the previous template");
-  for (const id of ["deepseek", "claude", "openai", "qwen", "kimi", "openrouter", "opencode-go"]) {
+  for (const id of ["deepseek", "claude", "openai", "qwen", "kimi", "openrouter", "opencode-go", "cheaper-inference"]) {
     const preset = getLLMProfilePreset(id);
     for (const key of ["api_key", "keep_alive", "llm_max_concurrent"]) assert.equal(key in preset, false, `${id} never sets ${key}`);
   }
+});
+
+test("the Cheaper Inference template never carries a key across the gateway boundary", () => {
+  const gateway = getLLMProfilePreset("cheaper-inference").base_url;
+  const base = Object.freeze({ name: "Gateway", proxy: "http://proxy:8080", session_header_key: "x-session", streaming: false, rate_per_minute: 7 });
+  // Into the gateway: a key entered for another provider (or an unknown previous destination) is cleared.
+  for (const from of ["deepseek", "openai", "openrouter", "opencode-go", "zai-general"]) {
+    const draft = Object.freeze({ ...base, api_key: "synthetic-other-provider-key", base_url: getLLMProfilePreset(from).base_url });
+    const next = applyLLMProfilePreset(draft, "cheaper-inference");
+    assert.equal(next.api_key, "", `${from} -> cheaper-inference clears the key`);
+    assert.equal(next.base_url, gateway);
+    for (const key of ["name", "proxy", "streaming", "rate_per_minute"]) assert.equal(next[key], draft[key], `${from} -> cheaper-inference keeps ${key}`);
+    assert.equal(draft.api_key, "synthetic-other-provider-key", "the original draft is not mutated");
+  }
+  for (const previousURL of ["", "https://api.example.invalid/v1", "http://api.cheaperinference.com/v1", "https://api.cheaperinference.com:8443/v1", "https://api.cheaperinference.com.example.invalid/v1", "https://api.cheaperinference.com@example.invalid/v1"]) {
+    assert.equal(applyLLMProfilePreset({ ...base, api_key: "synthetic-key", base_url: previousURL }, "cheaper-inference").api_key, "", `from ${previousURL || "blank"}`);
+  }
+  assert.equal(applyLLMProfilePreset({ ...base, api_key: "synthetic-key" }, "cheaper-inference").api_key, "", "a draft without base_url counts as an unknown destination");
+  // Out of the gateway: the gateway key is cleared for every other template.
+  for (const to of LLM_PROFILE_PRESET_IDS.filter((id) => id !== "cheaper-inference")) {
+    const next = applyLLMProfilePreset(Object.freeze({ ...base, format: "openai", api_key: "synthetic-gateway-key", base_url: gateway }), to);
+    assert.equal(next.api_key, "", `cheaper-inference -> ${to} clears the key`);
+  }
+  // Same effective destination: re-selecting the template or a path-only change keeps the entered key.
+  for (const sameURL of [gateway, "https://api.cheaperinference.com/v1/", " HTTPS://API.CHEAPERINFERENCE.COM/v1 ", "https://api.cheaperinference.com:443/other"]) {
+    const next = applyLLMProfilePreset(Object.freeze({ ...base, api_key: "synthetic-gateway-key", base_url: sameURL }), "cheaper-inference");
+    assert.equal(next.api_key, "synthetic-gateway-key", `same gateway origin ${sameURL} keeps the key`);
+  }
+  // Unrelated cloud switches keep the legacy behavior.
+  const legacy = applyLLMProfilePreset({ ...base, api_key: "synthetic-key", base_url: getLLMProfilePreset("deepseek").base_url }, "openai");
+  assert.equal(legacy.api_key, "synthetic-key");
+});
+
+test("editing the Base URL or relying on a stored key never crosses the Cheaper Inference gateway boundary", () => {
+  const gateway = "https://api.cheaperinference.com/v1";
+  const other = "https://api.example.invalid/v1";
+  assert.equal(crossesCheaperInferenceBoundary(other, gateway), true, "into the gateway");
+  assert.equal(crossesCheaperInferenceBoundary(gateway, other), true, "out of the gateway");
+  assert.equal(crossesCheaperInferenceBoundary("", gateway), true, "blank to the gateway");
+  assert.equal(crossesCheaperInferenceBoundary(gateway, "https://api.cheaperinference.co"), true, "a partially edited host leaves the gateway");
+  assert.equal(crossesCheaperInferenceBoundary(gateway, "http://api.cheaperinference.com/v1"), true, "a scheme change is a different origin");
+  assert.equal(crossesCheaperInferenceBoundary(gateway, "https://api.cheaperinference.com/v1/models"), false, "same origin");
+  assert.equal(crossesCheaperInferenceBoundary(gateway, "https://api.cheaperinference.com./v1"), false, "trailing host dot");
+  assert.equal(crossesCheaperInferenceBoundary(other, "https://api.deepseek.com"), false, "unrelated switches keep legacy behavior");
+  assert.equal(crossesCheaperInferenceBoundary("", ""), false);
+  // A blank key field would fall back to a stored or active key on the server.
+  assert.equal(requiresExplicitGatewayKey("", gateway, ""), true, "new gateway profile needs an entered key");
+  assert.equal(requiresExplicitGatewayKey("", gateway, "  "), true);
+  assert.equal(requiresExplicitGatewayKey("", gateway, "synthetic-gateway-key"), false);
+  assert.equal(requiresExplicitGatewayKey(other, gateway, ""), true, "stored other-provider key never reaches the gateway");
+  assert.equal(requiresExplicitGatewayKey(gateway, other, ""), true, "stored gateway key never reaches another provider");
+  assert.equal(requiresExplicitGatewayKey(gateway, "https://api.cheaperinference.com/v1/", ""), false, "same gateway keeps its stored key");
+  assert.equal(requiresExplicitGatewayKey(other, "https://api.deepseek.com", ""), false, "unrelated edits keep legacy fallback");
 });
 
 test("applying a template preserves entered secrets and unrelated draft preferences", () => {
