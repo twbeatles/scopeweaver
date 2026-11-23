@@ -111,4 +111,5 @@ func init() {
 	Register("Default profile", "Default profile", "기본 프로필")
 	Register("User switched task LLM from %s to %s", "User switched task LLM from %s to %s", "사용자가 작업 LLM을 %s에서 %s(으)로 전환했습니다")
 	Register("User manually switched the task LLM", "User manually switched the task LLM", "사용자가 작업 LLM을 수동 전환했습니다")
+	Register("This intent cannot be deleted in its current state", "This intent cannot be deleted in its current state", "이 의도는 현재 상태에서 삭제할 수 없습니다")
 }

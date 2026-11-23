@@ -8,8 +8,6 @@ import (
 	"github.com/Autumn-27/artex/locale"
 	"time"
 
-	"github.com/Autumn-27/artex/llmnet"
-	"github.com/Autumn-27/artex/locale"
 	"github.com/Autumn-27/artex/opencodesdk"
 )
 
@@ -198,6 +196,7 @@ VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,$9,$
 
 var (
 	ErrActiveLLMProfileDelete      = locale.NewError("cannot delete the active LLM profile; activate another profile first")
+	ErrActiveLLMProfileKeyRequired = locale.NewError("API key was not provided")
 	ErrLLMProfileReferencesChanged = locale.NewError("LLM profile references changed while deleting; retry the request")
 	ErrLLMProfileNotFound          = locale.NewError("LLM profile not found")
 )

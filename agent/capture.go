@@ -35,7 +35,7 @@ func captureRun(ctx context.Context, opts agentcore.Options, input string, emit 
 // captureRunSession is captureRun over an existing session, so a caller can run
 // multiple prompts on the SAME conversation (e.g. a settlement round that reuses
 // the worker's accumulated context after the main run hit max_turns).
-func captureRunSession(ctx context.Context, s *agentcore.Session, input string, emit func(db.Activity)) (string, harness.TerminalReason, error) {
+func captureRunSession(ctx context.Context, s *agentcore.Session, input string, emit func(db.Activity), observe ...func(harness.Event)) (string, harness.TerminalReason, error) {
 	ctx = intercept.WithProviderOrigin(ctx)
 	ctx, auditTrace := intercept.WithTrace(ctx, input, approvalHistory(s.Messages()))
 	defer auditTrace.Finish()

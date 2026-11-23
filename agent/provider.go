@@ -10,6 +10,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/Autumn-27/artex/locale"
 	"io"
@@ -24,6 +25,7 @@ import (
 	"github.com/Autumn-27/artex/llmnet"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/ollama"
+	"github.com/Autumn-27/artex/opencodesdk"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
@@ -372,6 +374,17 @@ func (c Config) NewProvider() (llm.Provider, error) {
 var nonFailoverHTTPStatus = regexp.MustCompile(`(?:status(?:\s+code)?|http(?:\s+status)?)\s*[=:]?\s*(?:401|403|5\d\d)\b`)
 var transientQuotaLimit = regexp.MustCompile(`(?i)(?:\b(?:rpm|tpm|rpd|qps)\b|quota[_\s-]*metric|rate[_\s-]*limit|too many requests|(?:requests?|tokens?)\s+(?:per|/)\s*(?:second|minute)|(?:per|/)\s*(?:second|minute)\s+(?:requests?|tokens?)|generate[_\s-]*requests[_\s-]*per[_\s-]*(?:minute|second)|tokens?[_\s-]*per[_\s-]*(?:minute|second))`)
 
+// IsQuotaExhaustedError trusts structured SDK evidence and preserves other providers' existing message rules.
+func IsQuotaExhaustedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var bridge *opencodesdk.BridgeError
+	if errors.As(err, &bridge) {
+		return bridge.QuotaExhausted()
+	}
+	return IsQuotaExhaustedMessage(err.Error())
+}
 func IsQuotaExhaustedMessage(message string) bool {
 	message = strings.ToLower(message)
 	// Authentication/authorization and provider-side 5xx failures never rotate,

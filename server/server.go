@@ -23,9 +23,11 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/chatstate"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmnet"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/locale"
+	"github.com/Autumn-27/artex/opencodesdk"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/llm"
@@ -72,6 +74,7 @@ type Server struct {
 	chatBusy      map[string]bool
 	chatClosing   bool
 	chatWG        sync.WaitGroup
+	httpWG        sync.WaitGroup
 	chatDrainDone chan struct{}
 	chatDrainErr  error
 	// chatCancel holds the cancel func for each in-flight conversation run (keyed by
@@ -125,7 +128,9 @@ type Server struct {
 	// channel coalesces enqueue bursts; the database remains the source of truth.
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
-	side        *sideQuestionState
+	// Startup and periodic DB users must finish before the manager closes stores.
+	backgroundWG sync.WaitGroup
+	side         *sideQuestionState
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.

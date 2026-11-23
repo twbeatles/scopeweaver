@@ -231,7 +231,12 @@ type Manager struct {
 	// this outer write lock an older request could commit first and publish last.
 	taskStateMu sync.Mutex
 	mu          sync.RWMutex
-	tasks       map[string]*Task
+	// schedulerMu closes registration before waiting; scheduler work can need mu.
+	schedulerMu      sync.Mutex
+	schedulerCancels []context.CancelFunc
+	schedulerWG      sync.WaitGroup
+	schedulerDone    chan struct{}
+	tasks            map[string]*Task
 	active      string
 	trafficOn   bool // Traffic capture flag (off by default; settings.traffic_capture).
 	llmRecOn    bool // LLM recording flag (off by default; settings.llm_record).
